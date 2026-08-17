@@ -1,12 +1,11 @@
+import "dotenv/config";
+
 import express from "express";
 import cors from "cors";
 import mysql from "mysql2/promise";
 import bcrypt from "bcryptjs";
-import dotenv from "dotenv";
 import jwt from "jsonwebtoken";
 import { generateSlug } from "./utils/helpers.js";
-
-dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -20,6 +19,8 @@ const pool = mysql.createPool({
     password: process.env.DB_PASSWORD,
     database: process.env.DB_NAME,
 });
+
+console.log(process.env.DB_HOST)
 
 const hashPassword = async (plainPassword) => {
     const salt = await bcrypt.genSalt(10);
@@ -104,7 +105,12 @@ export const verifyToken = (req, res, next) => {
 
 app.get("/posts", async (req, res) => {
     try {
-        const sql = "SELECT * FROM posts";
+        const sql = `
+            SELECT posts.*, user_accounts.user_name AS userName 
+            FROM posts 
+            JOIN user_accounts ON posts.user_id = user_accounts.id 
+            ORDER BY posts.created_at DESC
+        `;
         const [rows] = await pool.query(sql);
         res.status(200).json({ data: rows });
     } catch (error) {
@@ -113,18 +119,54 @@ app.get("/posts", async (req, res) => {
     }
 });
 
+app.get("/posts/search", async (req, res) => {
+    try {
+        const keyword = req.query.q; 
+        
+        let sql = `
+            SELECT posts.*, user_accounts.user_name AS userName 
+            FROM posts 
+            JOIN user_accounts ON posts.user_id = user_accounts.id
+        `;
+        let params = [];
+
+        if (keyword) {
+            sql += " WHERE posts.title LIKE ? OR posts.body LIKE ?";
+            const searchTerm = `%${keyword}%`;
+            params.push(searchTerm, searchTerm); 
+        }
+
+        sql += " ORDER BY posts.created_at DESC";
+
+        const [rows] = await pool.execute(sql, params);
+        
+        res.status(200).json({ data: rows });
+    } catch (error) {
+        console.error("Lỗi khi tìm bài viết: ", error);
+        res.status(500).json({message: "Lỗi server!"});
+    }
+});
+
 app.get("/posts/:slug", async (req, res) => {
     try {
         const postSlug = req.params.slug;
-        const [rows] = await pool.execute(
-            `SELECT * FROM posts WHERE slug = ? LIMIT 1`,
-            [postSlug]
-        );
+        const query = `
+            SELECT posts.*, user_accounts.user_name AS userName 
+            FROM posts 
+            JOIN user_accounts ON posts.user_id = user_accounts.id 
+            WHERE posts.slug = ? 
+            LIMIT 1
+        `;
+
+        const [rows] = await pool.execute(query, [postSlug]);
+        
         if (rows.length === 0) {
             return res.status(404).json({ message: "Không tìm thấy bài viết!" });
         }
 
-        res.status(200).json({ data: rows[0] });
+        const post = rows[0];
+
+        res.status(200).json({ data: post});
     } catch (error) {
         console.error("Lỗi khi lấy bài viết: ", error);
         res.status(500).json({ message: "Lỗi server!" });
@@ -147,10 +189,17 @@ app.post("/posts", verifyToken, async (req, res) => {
 
         const [result] = await pool.execute(sql, values);
 
-        res.status(200).json({
+        const [rows] = await pool.execute(
+            `SELECT posts.*, user_accounts.user_name AS userName 
+             FROM posts 
+             JOIN user_accounts ON posts.user_id = user_accounts.id 
+             WHERE posts.id = ? LIMIT 1`,
+            [result.insertId]
+        );
+
+        res.status(201).json({ 
             message: "Tạo bài viết thành công",
-            postID: result.insertId,
-            slug: slug,
+            data: rows[0] 
         });
 
     } catch (error) {
@@ -199,6 +248,28 @@ app.put("/posts/:slug", verifyToken, async (req, res) => {
             return res.status(400).json({ message: "Tiêu đề này đã bị trùng với một bài viết khác!" });
         }
         res.status(500).json({ message: "Lỗi server!" });
+    }
+});
+
+app.delete("/posts/comments/:id", verifyToken, async (req, res) => {
+    try {
+        const id = req.params.id;
+        const user_id = req.user.id;
+        const user_role = req.user.role;
+        const sql2 = "SELECT user_id FROM comments WHERE id=?"
+        
+        const [rows] = await pool.execute(sql2, [id]);
+        
+        if(user_id === rows[0].user_id || user_role === "admin") {
+            const sql = "DELETE FROM comments WHERE id=? ";
+            await pool.execute(sql, [id]);
+        } else {
+            res.status(403).json({message: "Bạn không có quyền xóa bình luận này"});
+        }
+        res.status(200).json({message: "Xóa bài viết thành công"});
+    } catch (error) {
+        console.error("Lỗi khi xóa bình luận: ", error);
+        res.status(500).json({message: "Lỗi server"});
     }
 });
 
@@ -268,6 +339,9 @@ app.get("/users/:id", verifyToken, async (req, res) => {
     try {
         const userId = req.params.id;
 
+        if(userId !== req.user.id)
+            return res.status(403).json({message: "Không có quyền lấy thông tin của tài khoản khác"});
+
         const sql = `SELECT id, user_name, email, phone_number, role FROM user_accounts WHERE id = ?`;
         const [rows] = await pool.execute(sql, [userId]);
 
@@ -275,10 +349,29 @@ app.get("/users/:id", verifyToken, async (req, res) => {
             return res.status(404).json({ message: "Không tìm thấy người dùng!" });
         }
 
+
+
         const user = rows[0];
         res.status(200).json({ data: user });
     } catch (error) {
         console.error("Lỗi khi lấy thông tin người dùng: ", error);
+        res.status(500).json({ message: "Lỗi server!" });
+    }
+});
+
+app.put("/users/info", verifyToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const newUser = req.body;
+        if(userId === req.body.id) {
+            const sql = "UPDATE user_accounts SET email = ?, phone_number = ? WHERE id = ?";
+            await pool.execute(sql, [newUser.email, newUser.phone_number, userId]);
+        } else {
+            res.status(403).json({message: "Bạn không có quyền sửa thông tin của tài khoản khác"});
+        }
+        res.status(200).json({message: "Cập nhật thông tin thành công"});
+    } catch (error) {
+       console.error("Lỗi khi cập nhật thông tin người dùng: ", error);
         res.status(500).json({ message: "Lỗi server!" });
     }
 });
